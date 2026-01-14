@@ -8,36 +8,43 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <cstdlib> // For system()
+
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#define MKDIR(path) mkdir(path, 0777)
+#endif
+
 
 using namespace cv;
 using namespace std;
 
-// --- CẤU HÌNH BỘ NHỚ ---
-// Số lượng frame tối đa được phép lưu trong RAM.
-// 1 Frame 720p ~ 2.7 MB. 
-// 600 Frames ~ 1.6 GB RAM (Dành cho Pi 4/5 2GB+ RAM).
-// Nếu Pi của bạn RAM ít (1GB), hãy giảm xuống 200.
-const int POOL_SIZE = 600; 
+// --- MEMORY CONFIGURATION ---
+const int POOL_SIZE = 2500; 
 
-// --- CÁC BIẾN TOÀN CỤC ---
-queue<Mat*> empty_pool; // Kho chứa các khung hình rỗng (để tái sử dụng)
-queue<Mat*> full_queue; // Hàng đợi chứa ảnh đã chụp (chờ ghi)
+// --- GLOBAL VARIABLES ---
+queue<Mat*> empty_pool;
+queue<Mat*> full_queue;
 
 mutex mtx;
 condition_variable cv_writer;
 bool is_capturing = true;
 
-// Thống kê
+// Statistics
 int frames_captured = 0;
 int frames_written = 0;
 int frames_dropped = 0;
 
-// --- LUỒNG GHI ĐĨA (CONSUMER) ---
+// --- DISK WRITER THREAD ---
 void writer_thread_func(string filename, int width, int height, double fps) {
+    // Still saving as AVI (MJPG) for the fastest disk writing speed
     VideoWriter out(filename, VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(width, height));
     
     if (!out.isOpened()) {
-        cerr << "[Writer] Error: Cannot open file!" << endl;
+        cerr << "[Writer] Error: Cannot open file for writing!" << endl;
         return;
     }
     
@@ -48,7 +55,7 @@ void writer_thread_func(string filename, int width, int height, double fps) {
 
         {
             unique_lock<mutex> lock(mtx);
-            // Chờ khi có hàng hoặc đã quay xong
+            // Wait for frames in the queue or until capturing is finished
             cv_writer.wait(lock, []{ return !full_queue.empty() || !is_capturing; });
 
             if (full_queue.empty() && !is_capturing) break;
@@ -60,12 +67,10 @@ void writer_thread_func(string filename, int width, int height, double fps) {
         }
 
         if (frame_ptr != nullptr) {
-            // 1. Ghi vào đĩa
             out.write(*frame_ptr);
             frames_written++;
 
-            // 2. [QUAN TRỌNG] Tái chế: Trả frame rỗng về kho (Empty Pool) để dùng lại
-            // Không hủy (delete) bộ nhớ -> Tiết kiệm CPU
+            // Return the empty frame to the pool for reuse
             {
                 lock_guard<mutex> lock(mtx);
                 empty_pool.push(frame_ptr);
@@ -73,66 +78,74 @@ void writer_thread_func(string filename, int width, int height, double fps) {
         }
     }
     out.release();
-    cout << "[Writer] Finished." << endl;
+    cout << "[Writer] Finished writing AVI file." << endl;
+}
+
+void create_directories() {
+    MKDIR("recordings");
+    MKDIR("recordings/h264");
 }
 
 int main() {
-    VideoCapture cap(0, CAP_V4L2);
-    if (!cap.isOpened()) return -1;
+    // 1. Create directories for video files if they don't exist
+    create_directories();
 
-    // --- 1. CẤU HÌNH CAMERA (ÉP XUNG) ---
+    VideoCapture cap(0, CAP_V4L2);
+    if (!cap.isOpened()) {
+        cerr << "Error: Cannot open camera." << endl;
+        return -1;
+    }
+
+    // --- CAMERA CONFIGURATION ---
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(CAP_PROP_FRAME_WIDTH, 1280);
     cap.set(CAP_PROP_FRAME_HEIGHT, 720);
     cap.set(CAP_PROP_FPS, 60);
 
-    // [BÍ KÍP] Chỉnh Exposure để đạt 60 FPS
-    // Nếu ảnh tối, hãy tăng 0.01 lên 0.02
-    cap.set(CAP_PROP_AUTO_EXPOSURE, 0.25); // Manual Mode
-    cap.set(CAP_PROP_EXPOSURE, 0.01);      // 10ms exposure time
+    // Adjust Exposure (Important to achieve 60fps)
+    cap.set(CAP_PROP_AUTO_EXPOSURE, 0.25); 
+    cap.set(CAP_PROP_EXPOSURE, 0.01);      
 
-    // Warm up
-    cout << "Allocating memory pool..." << endl;
-    
-    // --- 2. KHỞI TẠO BỘ NHỚ (PRE-ALLOCATION) ---
-    // Cấp phát trước toàn bộ RAM cần dùng. Lúc quay sẽ không xin thêm RAM nữa.
+    // --- ALLOCATE RAM ---
+    cout << "Allocating memory pool... This might take a moment." << endl;
     vector<Mat> memory_block(POOL_SIZE); 
     for(int i=0; i<POOL_SIZE; i++) {
-        // Khởi tạo sẵn kích thước để tránh re-allocate sau này
         memory_block[i] = Mat::zeros(720, 1280, CV_8UC3);
         empty_pool.push(&memory_block[i]);
     }
     
-    // Đọc thử vài frame để camera ổn định
+    // Warm up the camera
     for(int i=0; i<20; i++) { Mat t; cap >> t; }
 
-    double w = cap.get(CAP_PROP_FRAME_WIDTH);
-    double h = cap.get(CAP_PROP_FRAME_HEIGHT);
-    cout << "Camera: " << w << "x" << h << endl;
+    double frame_width = cap.get(CAP_PROP_FRAME_WIDTH);
+    double frame_height = cap.get(CAP_PROP_FRAME_HEIGHT);
+    cout << "Camera resolution: " << frame_width << "x" << frame_height << endl;
 
-    // File setup
+    // --- GENERATE FILENAME ---
     time_t now = time(0);
     tm *ltm = localtime(&now);
     char buf[100];
-    strftime(buf, 100, "%Y-%m-%d_%H-%M-%S.avi", ltm);
-    string path = "/home/comvis/Bee_monitoring/record/" + string(buf);
+    strftime(buf, 100, "%Y-%m-%d_%H-%M-%S", ltm);
+    string timestamp_str = string(buf);
 
-    // Chạy Writer Thread (Set cứng 60.0 fps)
-    thread t_writer(writer_thread_func, path, (int)w, (int)h, 60.0);
+    string avi_path = "recordings/" + timestamp_str + ".avi";
+    string mp4_path = "recordings/h264/" + timestamp_str + ".mp4";
 
-    cout << "--- START RECORDING (60s) ---" << endl;
-    auto start = chrono::steady_clock::now();
-    int duration = 60;
+    // Start the Writer Thread (for AVI)
+    thread writer_thread(writer_thread_func, avi_path, (int)frame_width, (int)frame_height, 60.0);
 
-    Mat temp_frame; // Biến tạm
+    cout << "--- STARTING RECORDING (60s) ---" << endl;
+    auto start_time = chrono::steady_clock::now();
+    int duration_seconds = 60;
 
-    // --- 3. VÒNG LẶP CAPTURE (SIÊU TỐC) ---
+    Mat temp_frame; 
+
+    // --- CAPTURE LOOP ---
     while (true) {
-        // Đọc vào biến tạm trước
         cap >> temp_frame; 
         
         if (temp_frame.empty()) {
-            cout << "Lost frame!" << endl;
+            cout << "Lost frame from camera!" << endl;
             break;
         }
         
@@ -141,7 +154,6 @@ int main() {
         Mat* dest_frame = nullptr;
         {
             lock_guard<mutex> lock(mtx);
-            // Lấy một cái chai rỗng từ kho
             if (!empty_pool.empty()) {
                 dest_frame = empty_pool.front();
                 empty_pool.pop();
@@ -149,47 +161,62 @@ int main() {
         }
 
         if (dest_frame != nullptr) {
-            // [QUAN TRỌNG] Copy dữ liệu vào vùng nhớ có sẵn (Nhanh hơn clone nhiều)
-            temp_frame.copyTo(*dest_frame);
-
-            // Đẩy vào hàng đợi ghi
+            temp_frame.copyTo(*dest_frame); // Copy to RAM buffer
             {
                 lock_guard<mutex> lock(mtx);
                 full_queue.push(dest_frame);
             }
             cv_writer.notify_one();
         } else {
-            // Hết sạch chai rỗng (RAM đầy, Writer ghi không kịp) -> Buộc phải Drop
-            // Nhưng vì POOL_SIZE lớn (600), rất khó xảy ra chuyện này trừ khi thẻ nhớ hư.
-            frames_dropped++;
+            frames_dropped++; // Should only happen if RAM is full
         }
 
-        if (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start).count() >= duration) {
+        if (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count() >= duration_seconds) {
             break;
         }
     }
 
-    // --- 4. KẾT THÚC ---
-    auto end_cap = chrono::steady_clock::now();
-    double cap_time = chrono::duration_cast<chrono::milliseconds>(end_cap - start).count() / 1000.0;
+    // --- END RECORDING ---
+    auto end_capture_time = chrono::steady_clock::now();
+    double capture_time_ms = chrono::duration_cast<chrono::milliseconds>(end_capture_time - start_time).count();
+    double capture_time_s = capture_time_ms / 1000.0;
 
-    cout << "Capture finished. Waiting for writer to flush..." << endl;
+
+    cout << "Capture finished. Flushing RAM to Disk... (Do not exit)" << endl;
     
     {
         lock_guard<mutex> lock(mtx);
         is_capturing = false;
     }
     cv_writer.notify_one();
-    if (t_writer.joinable()) t_writer.join();
+    if (writer_thread.joinable()) writer_thread.join();
 
-    cout << "---------------- REPORT ----------------" << endl;
-    cout << "Real Time       : " << cap_time << "s" << endl;
-    cout << "Frames Captured : " << frames_captured << " (Avg: " << frames_captured/cap_time << " FPS)" << endl;
-    cout << "Frames Written  : " << frames_written << endl;
-    cout << "Frames Dropped  : " << frames_dropped << endl;
+    cout << "----------------- REPORT -----------------" << endl;
+    cout << "Actual Recording Time: " << capture_time_s << "s" << endl;
+    cout << "Frames Captured      : " << frames_captured << " (Avg: " << frames_captured / capture_time_s << " FPS)" << endl;
+    cout << "Frames Written       : " << frames_written << endl;
+    cout << "Frames Dropped       : " << frames_dropped << endl;
     
-    if (frames_dropped == 0 && frames_written > 3000) {
-        cout << "RESULT: PERFECT 60 FPS RECORDING!" << endl;
+    // --- FINAL STEP: CONVERT TO MP4 (FFMPEG) ---
+    if (frames_written > 100) {
+        cout << "\n[FFmpeg] Converting AVI to MP4..." << endl;
+        
+        // Standard FFmpeg command + 'ultrafast' preset for speed
+        string ffmpeg_cmd = "ffmpeg -y -i " + avi_path + 
+                           " -c:v libx264 -pix_fmt yuv420p -vtag avc1 -movflags +faststart " +
+                           "-preset ultrafast " + 
+                           mp4_path;
+                     
+        cout << "Executing: " << ffmpeg_cmd << endl;
+        int result = system(ffmpeg_cmd.c_str());
+
+        if (result == 0) {
+            cout << "[Success] MP4 saved to: " << mp4_path << endl;
+            // Uncomment the line below to delete the original AVI file
+            // remove(avi_path.c_str());
+        } else {
+            cerr << "[Error] FFmpeg conversion failed. Please check if FFmpeg is installed and in your PATH." << endl;
+        }
     }
     
     return 0;
