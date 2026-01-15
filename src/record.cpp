@@ -3,217 +3,88 @@
 #include <chrono>
 #include <ctime>
 #include <string>
-#include <thread>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <vector>
-#include <cstdlib>
-#include <sys/stat.h>
-#include <algorithm>
 
 using namespace cv;
 using namespace std;
 
-const int POOL_SIZE = 2500;
-
-queue<Mat*> empty_pool;
-queue<Mat*> full_queue;
-mutex mtx;
-condition_variable cv_writer;
-bool is_capturing = true;
-
-int frames_captured = 0;
-int frames_written = 0;
-int frames_dropped = 0;
-
-void writer_thread_func(string filename, int width, int height, double fps) {
-    VideoWriter out(filename, VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(width, height));
-    
-    if (!out.isOpened()) {
-        cerr << "[Writer] Error: Cannot open file: " << filename << endl;
-        return;
-    }
-    
-    cout << "[Writer] Ready. File: " << filename << endl;
-
-    while (true) {
-        Mat* frame_ptr = nullptr;
-        {
-            unique_lock<mutex> lock(mtx);
-            cv_writer.wait(lock, []{ return !full_queue.empty() || !is_capturing; });
-            if (full_queue.empty() && !is_capturing) break;
-            if (!full_queue.empty()) {
-                frame_ptr = full_queue.front();
-                full_queue.pop();
-            }
-        }
-
-        if (frame_ptr != nullptr) {
-            out.write(*frame_ptr);
-            frames_written++;
-            {
-                lock_guard<mutex> lock(mtx);
-                empty_pool.push(frame_ptr);
-            }
-        }
-    }
-    out.release();
-    cout << "[Writer] Finished writing AVI." << endl;
-}
-
-string getCmdOption(char ** begin, char ** end, const std::string & option) {
-    char ** itr = std::find(begin, end, option);
-    if (itr != end && ++itr != end) {
-        return std::string(*itr);
-    }
-    return "";
+// Hàm lấy tên file theo thời gian
+string get_timestamp_filename() {
+    time_t now = time(0);
+    tm *ltm = localtime(&now);
+    char buf[100];
+    strftime(buf, 100, "pi03_%Y-%m-%d_%H-%M-%S.mjpg", ltm); // Lưu đuôi .mjpg
+    return string(buf);
 }
 
 int main(int argc, char** argv) {
-    system("mkdir -p /home/comvis/Bee_monitoring/record/h264/");
+    // 1. CHUẨN BỊ ĐƯỜNG DẪN
+    string save_path = "/home/comvis/Bee_monitoring/record/" + get_timestamp_filename();
+    cout << "Recording to: " << save_path << endl;
 
-    VideoCapture cap(0, CAP_V4L2);
-    if (!cap.isOpened()) return -1;
+    // 2. XÂY DỰNG PIPELINE GSTREAMER
+    // Giải thích Pipeline:
+    // v4l2src: Lấy dữ liệu từ camera (Linux)
+    // tee: Chia dòng dữ liệu làm 2 nhánh (t.)
+    // Nhánh 1 (Save): queue -> filesink (Ghi thẳng xuống đĩa, cực nhanh)
+    // Nhánh 2 (App):  queue -> jpegdec (giải mã) -> videoconvert -> appsink (đưa vào OpenCV Mat)
+    
+    string pipeline = "v4l2src device=/dev/video0 ! "
+                      "image/jpeg, width=1280, height=720, framerate=60/1 ! "
+                      "tee name=t "
+                      "t. ! queue max-size-buffers=0 max-size-time=0 ! "
+                      "filesink location=" + save_path + " "
+                      "t. ! queue max-size-buffers=1 ! "
+                      "jpegdec ! videoconvert ! appsink sync=false";
 
-    // Cấu hình Camera
-    cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    cap.set(CAP_PROP_FRAME_WIDTH, 1280);
-    cap.set(CAP_PROP_FRAME_HEIGHT, 720);
-    cap.set(CAP_PROP_FPS, 60);
-    cap.set(CAP_PROP_AUTO_EXPOSURE, 0.25); 
-    cap.set(CAP_PROP_EXPOSURE, 0.01);       
+    cout << "Opening Pipeline..." << endl;
+    
+    // Mở Camera bằng backend GStreamer
+    VideoCapture cap(pipeline, CAP_GSTREAMER);
 
-    cout << "Allocating memory pool (~6.2 GB)..." << endl;
-    vector<Mat> memory_block(POOL_SIZE); 
-    for(int i=0; i<POOL_SIZE; i++) {
-        memory_block[i] = Mat::zeros(720, 1280, CV_8UC3);
-        empty_pool.push(&memory_block[i]);
+    if (!cap.isOpened()) {
+        cerr << "Error: Could not open GStreamer pipeline. Check v4l2-ctl settings!" << endl;
+        return -1;
     }
 
-    // Warm up camera
-    for(int i=0; i<20; i++) { Mat t; cap >> t; }
-
-    double w = cap.get(CAP_PROP_FRAME_WIDTH);
-    double h = cap.get(CAP_PROP_FRAME_HEIGHT);
-    string input_name = getCmdOption(argv, argv + argc, "--name");
+    cout << "--- START RECORDING (GStreamer Pipeline) ---" << endl;
     
-    string filename_mp4 = "";
-    string filename_base = "";
-
-    if (!input_name.empty()) {
-        filename_mp4 = input_name;
-        size_t lastindex = input_name.find_last_of("."); 
-        if (lastindex != string::npos) { 
-            filename_base = input_name.substr(0, lastindex); 
-        } else {
-            filename_base = input_name;
-        }
-    } else {
-        time_t now = time(0);
-        tm *ltm = localtime(&now);
-        char buf[100];
-        strftime(buf, 100, "%Y-%m-%d_%H-%M-%S", ltm);
-        string timestamp_str = string(buf);
-        
-        filename_base = "pi03_" + timestamp_str;
-        filename_mp4 = filename_base + ".mp4";
-    }
-
-    string avi_path = "/home/comvis/Bee_monitoring/record/" + filename_base + ".avi";
-    string mp4_path = "/home/comvis/Bee_monitoring/record/h264/" + filename_mp4;
-
-    cout << "Target MP4: " << mp4_path << endl;
-    cout << "Temp AVI:   " << avi_path << endl;
-
-    thread t_writer(writer_thread_func, avi_path, (int)w, (int)h, 60.0);
-
-    cout << "--- START RECORDING ---" << endl;
-    
+    Mat frame;
+    int frames_read = 0;
     auto start_time = chrono::steady_clock::now();
-    
-    // --- PHẦN THAY ĐỔI CHÍNH Ở ĐÂY ---
-    // Loại bỏ Mat temp_frame;
-    
+
     while (true) {
-        Mat* dest_frame = nullptr;
-
-        // 1. LẤY POINTER TỪ POOL TRƯỚC
-        {
-            lock_guard<mutex> lock(mtx);
-            if (!empty_pool.empty()) {
-                dest_frame = empty_pool.front();
-                empty_pool.pop();
-            }
-        }
-
-        if (dest_frame != nullptr) {
-            // 2. GHI THẲNG TỪ CAMERA VÀO DEST_FRAME (ZERO-COPY)
-            // Thay vì: cap >> temp; temp.copyTo(*dest);
-            if (cap.read(*dest_frame)) {
-                frames_captured++;
-                {
-                    lock_guard<mutex> lock(mtx);
-                    full_queue.push(dest_frame);
-                }
-                cv_writer.notify_one();
-            } else {
-                // Nếu camera lỗi/ngắt kết nối, trả lại bộ nhớ và thoát
-                {
-                    lock_guard<mutex> lock(mtx);
-                    empty_pool.push(dest_frame);
-                }
-                break;
-            }
+        // Đọc frame từ nhánh 'appsink'. 
+        // Lưu ý: Việc GHI FILE đang diễn ra ngầm ở nhánh 'filesink' của GStreamer
+        // nên việc gọi cap.read() chậm hay nhanh không ảnh hưởng việc mất frame của file ghi.
+        if (cap.read(frame)) {
+            frames_read++;
+            
+            // --- XỬ LÝ FRAME TẠI ĐÂY (NẾU CẦN) ---
+            // Ví dụ: imshow("Monitor", frame);
+            // waitKey(1);
+            // -------------------------------------
         } else {
-            // 3. XỬ LÝ KHI POOL ĐẦY (RAM HẾT CHỖ)
-            // Vì ta chưa gọi cap.read(), buffer phần cứng camera vẫn còn giữ frame cũ.
-            // Phải gọi grab() để xả frame đó đi, tránh bị trễ hình (latency).
-            cap.grab(); 
-            frames_dropped++;
-        }
-
-        // Kiểm tra thời gian dừng (60s)
-        auto current_time = chrono::steady_clock::now();
-        double elapsed_check = chrono::duration_cast<chrono::duration<double>>(current_time - start_time).count();
-        if (elapsed_check >= 60.0) {
+            cout << "Stream ended or error." << endl;
             break;
         }
+
+        // Kiểm tra 60s
+        auto current_time = chrono::steady_clock::now();
+        double elapsed = chrono::duration_cast<chrono::duration<double>>(current_time - start_time).count();
+        if (elapsed >= 60.0) break;
     }
-    // --- HẾT PHẦN THAY ĐỔI ---
 
-    auto end_time = chrono::steady_clock::now();
-    double total_elapsed_seconds = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
-
-    {
-        lock_guard<mutex> lock(mtx);
-        is_capturing = false;
-    }
-    cv_writer.notify_one();
-    if (t_writer.joinable()) t_writer.join();
-
-    cout << "---------------- REPORT ----------------" << endl;
-    cout << "Time Elapsed    : " << total_elapsed_seconds << " sec" << endl;
-    cout << "Frames Captured : " << frames_captured << endl;
-    cout << "Frames Written  : " << frames_written << endl;
-    cout << "Frames Dropped  : " << frames_dropped << endl;
+    cap.release(); // Quan trọng: Đóng pipeline để flush dữ liệu xuống file
     
-    double real_fps = 0.0;
-    if (total_elapsed_seconds > 0) {
-        real_fps = frames_written / total_elapsed_seconds;
-    }
-    cout << "Real FPS        : " << real_fps << endl;
-
-    if (frames_written > 100 && real_fps > 0) {
-        cout << "\n[FFmpeg] Converting to MP4 with Real FPS..." << endl;
-        
-        string cmd = "ffmpeg -y -r " + to_string(real_fps) + " -i " + avi_path + 
-                     " -c:v libx264 -pix_fmt yuv420p -vtag avc1 -movflags +faststart " +
-                     " -preset ultrafast " + 
-                     mp4_path;
-                     
-        system(cmd.c_str());
-    }
+    cout << "Finished. Total frames read by App: " << frames_read << endl;
     
+    // Convert sang MP4 sau khi quay xong (Offline processing)
+    string mp4_path = save_path + ".mp4"; // output name trick
+    cout << "Converting to MP4..." << endl;
+    string cmd = "ffmpeg -y -f mjpeg -framerate 60 -i " + save_path + 
+                 " -c:v libx264 -preset ultrafast -pix_fmt yuv420p " + 
+                 "/home/comvis/Bee_monitoring/record/h264/" + get_timestamp_filename() + ".mp4";
+    system(cmd.c_str());
+
     return 0;
 }
