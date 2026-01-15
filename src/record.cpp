@@ -10,7 +10,7 @@
 #include <vector>
 #include <cstdlib>
 #include <sys/stat.h>
-#include <algorithm> // Thêm thư viện này để dùng std::find
+#include <algorithm>
 
 using namespace cv;
 using namespace std;
@@ -28,8 +28,6 @@ int frames_written = 0;
 int frames_dropped = 0;
 
 void writer_thread_func(string filename, int width, int height, double fps) {
-    // Lưu ý: FPS ở đây cho file AVI tạm thời không quá quan trọng
-    // vì ta sẽ sửa lại FPS chuẩn khi convert sang MP4
     VideoWriter out(filename, VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(width, height));
     
     if (!out.isOpened()) {
@@ -118,7 +116,7 @@ int main(int argc, char** argv) {
         strftime(buf, 100, "%Y-%m-%d_%H-%M-%S", ltm);
         string timestamp_str = string(buf);
         
-        filename_base = "pi02_" + timestamp_str;
+        filename_base = "pi03_" + timestamp_str;
         filename_mp4 = filename_base + ".mp4";
     }
 
@@ -128,22 +126,19 @@ int main(int argc, char** argv) {
     cout << "Target MP4: " << mp4_path << endl;
     cout << "Temp AVI:   " << avi_path << endl;
 
-    // Khởi tạo writer với 60fps tạm thời
     thread t_writer(writer_thread_func, avi_path, (int)w, (int)h, 60.0);
 
     cout << "--- START RECORDING ---" << endl;
     
-    // BẮT ĐẦU ĐO THỜI GIAN CHÍNH XÁC
     auto start_time = chrono::steady_clock::now();
     
-    Mat temp_frame; 
+    // --- PHẦN THAY ĐỔI CHÍNH Ở ĐÂY ---
+    // Loại bỏ Mat temp_frame;
+    
     while (true) {
-        cap >> temp_frame; 
-        if (temp_frame.empty()) break;
-        
-        frames_captured++;
-
         Mat* dest_frame = nullptr;
+
+        // 1. LẤY POINTER TỪ POOL TRƯỚC
         {
             lock_guard<mutex> lock(mtx);
             if (!empty_pool.empty()) {
@@ -153,13 +148,28 @@ int main(int argc, char** argv) {
         }
 
         if (dest_frame != nullptr) {
-            temp_frame.copyTo(*dest_frame);
-            {
-                lock_guard<mutex> lock(mtx);
-                full_queue.push(dest_frame);
+            // 2. GHI THẲNG TỪ CAMERA VÀO DEST_FRAME (ZERO-COPY)
+            // Thay vì: cap >> temp; temp.copyTo(*dest);
+            if (cap.read(*dest_frame)) {
+                frames_captured++;
+                {
+                    lock_guard<mutex> lock(mtx);
+                    full_queue.push(dest_frame);
+                }
+                cv_writer.notify_one();
+            } else {
+                // Nếu camera lỗi/ngắt kết nối, trả lại bộ nhớ và thoát
+                {
+                    lock_guard<mutex> lock(mtx);
+                    empty_pool.push(dest_frame);
+                }
+                break;
             }
-            cv_writer.notify_one();
         } else {
+            // 3. XỬ LÝ KHI POOL ĐẦY (RAM HẾT CHỖ)
+            // Vì ta chưa gọi cap.read(), buffer phần cứng camera vẫn còn giữ frame cũ.
+            // Phải gọi grab() để xả frame đó đi, tránh bị trễ hình (latency).
+            cap.grab(); 
             frames_dropped++;
         }
 
@@ -170,8 +180,8 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    // --- HẾT PHẦN THAY ĐỔI ---
 
-    // KẾT THÚC ĐO THỜI GIAN
     auto end_time = chrono::steady_clock::now();
     double total_elapsed_seconds = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
@@ -186,8 +196,8 @@ int main(int argc, char** argv) {
     cout << "Time Elapsed    : " << total_elapsed_seconds << " sec" << endl;
     cout << "Frames Captured : " << frames_captured << endl;
     cout << "Frames Written  : " << frames_written << endl;
+    cout << "Frames Dropped  : " << frames_dropped << endl;
     
-    // TÍNH FPS THỰC TẾ
     double real_fps = 0.0;
     if (total_elapsed_seconds > 0) {
         real_fps = frames_written / total_elapsed_seconds;
