@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <algorithm> // Thêm thư viện này để dùng std::find
 
 using namespace cv;
 using namespace std;
@@ -27,6 +28,8 @@ int frames_written = 0;
 int frames_dropped = 0;
 
 void writer_thread_func(string filename, int width, int height, double fps) {
+    // Lưu ý: FPS ở đây cho file AVI tạm thời không quá quan trọng
+    // vì ta sẽ sửa lại FPS chuẩn khi convert sang MP4
     VideoWriter out(filename, VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(width, height));
     
     if (!out.isOpened()) {
@@ -75,12 +78,13 @@ int main(int argc, char** argv) {
     VideoCapture cap(0, CAP_V4L2);
     if (!cap.isOpened()) return -1;
 
+    // Cấu hình Camera
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M', 'J', 'P', 'G'));
     cap.set(CAP_PROP_FRAME_WIDTH, 1280);
     cap.set(CAP_PROP_FRAME_HEIGHT, 720);
     cap.set(CAP_PROP_FPS, 60);
     cap.set(CAP_PROP_AUTO_EXPOSURE, 0.25); 
-    cap.set(CAP_PROP_EXPOSURE, 0.01);      
+    cap.set(CAP_PROP_EXPOSURE, 0.01);       
 
     cout << "Allocating memory pool (~6.2 GB)..." << endl;
     vector<Mat> memory_block(POOL_SIZE); 
@@ -89,6 +93,7 @@ int main(int argc, char** argv) {
         empty_pool.push(&memory_block[i]);
     }
 
+    // Warm up camera
     for(int i=0; i<20; i++) { Mat t; cap >> t; }
 
     double w = cap.get(CAP_PROP_FRAME_WIDTH);
@@ -123,10 +128,13 @@ int main(int argc, char** argv) {
     cout << "Target MP4: " << mp4_path << endl;
     cout << "Temp AVI:   " << avi_path << endl;
 
+    // Khởi tạo writer với 60fps tạm thời
     thread t_writer(writer_thread_func, avi_path, (int)w, (int)h, 60.0);
 
     cout << "--- START RECORDING ---" << endl;
-    auto start = chrono::steady_clock::now();
+    
+    // BẮT ĐẦU ĐO THỜI GIAN CHÍNH XÁC
+    auto start_time = chrono::steady_clock::now();
     
     Mat temp_frame; 
     while (true) {
@@ -155,10 +163,17 @@ int main(int argc, char** argv) {
             frames_dropped++;
         }
 
-        if (chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start).count() >= 60) {
+        // Kiểm tra thời gian dừng (60s)
+        auto current_time = chrono::steady_clock::now();
+        double elapsed_check = chrono::duration_cast<chrono::duration<double>>(current_time - start_time).count();
+        if (elapsed_check >= 60.0) {
             break;
         }
     }
+
+    // KẾT THÚC ĐO THỜI GIAN
+    auto end_time = chrono::steady_clock::now();
+    double total_elapsed_seconds = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
     {
         lock_guard<mutex> lock(mtx);
@@ -168,15 +183,25 @@ int main(int argc, char** argv) {
     if (t_writer.joinable()) t_writer.join();
 
     cout << "---------------- REPORT ----------------" << endl;
+    cout << "Time Elapsed    : " << total_elapsed_seconds << " sec" << endl;
     cout << "Frames Captured : " << frames_captured << endl;
     cout << "Frames Written  : " << frames_written << endl;
+    
+    // TÍNH FPS THỰC TẾ
+    double real_fps = 0.0;
+    if (total_elapsed_seconds > 0) {
+        real_fps = frames_written / total_elapsed_seconds;
+    }
+    cout << "Real FPS        : " << real_fps << endl;
 
-    if (frames_written > 100) {
-        cout << "\n[FFmpeg] Converting to MP4..." << endl;
-        string cmd = "ffmpeg -y -i " + avi_path + 
+    if (frames_written > 100 && real_fps > 0) {
+        cout << "\n[FFmpeg] Converting to MP4 with Real FPS..." << endl;
+        
+        string cmd = "ffmpeg -y -r " + to_string(real_fps) + " -i " + avi_path + 
                      " -c:v libx264 -pix_fmt yuv420p -vtag avc1 -movflags +faststart " +
-                     "-preset ultrafast " + 
+                     " -preset ultrafast " + 
                      mp4_path;
+                     
         system(cmd.c_str());
     }
     
