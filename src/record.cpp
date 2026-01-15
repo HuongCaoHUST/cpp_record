@@ -15,20 +15,17 @@
 using namespace cv;
 using namespace std;
 
-// --- CẤU HÌNH HỆ THỐNG ---
 const int TARGET_FPS = 60;
 const int RECORD_SECONDS = 60;
-const string RAM_DIR = "/dev/shm/"; // Thư mục trên RAM (Cực nhanh)
+const string RAM_DIR = "/dev/shm/";
 const string SD_DIR = "/home/comvis/Bee_monitoring/record/h264/";
 
-// --- BIẾN TOÀN CỤC CHO THREAD ---
 queue<Mat> frame_queue;
 mutex mtx;
 condition_variable cv_writer;
 bool is_capturing = true;
 int frames_written = 0;
 
-// Hàm hỗ trợ lấy option từ dòng lệnh
 string getCmdOption(char ** begin, char ** end, const std::string & option) {
     char ** itr = std::find(begin, end, option);
     if (itr != end && ++itr != end) {
@@ -37,7 +34,6 @@ string getCmdOption(char ** begin, char ** end, const std::string & option) {
     return "";
 }
 
-// Hàm lấy thời gian hiện tại (Backup nếu không truyền tên)
 string get_timestamp_str() {
     time_t now = time(0);
     tm *ltm = localtime(&now);
@@ -46,9 +42,7 @@ string get_timestamp_str() {
     return string(buf);
 }
 
-// --- THREAD GHI FILE (VÀO RAM) ---
 void writer_thread_func(string filename) {
-    // Mở file nhị phân
     ofstream outfile(filename, ios::out | ios::binary);
     if (!outfile.is_open()) {
         cerr << "[Writer] Critical Error: Cannot create file in RAM: " << filename << endl;
@@ -61,7 +55,6 @@ void writer_thread_func(string filename) {
         Mat current_frame;
         {
             unique_lock<mutex> lock(mtx);
-            // Chờ đến khi có frame hoặc dừng quay
             cv_writer.wait(lock, []{ return !frame_queue.empty() || !is_capturing; });
             
             if (frame_queue.empty() && !is_capturing) break;
@@ -73,7 +66,6 @@ void writer_thread_func(string filename) {
         }
 
         if (!current_frame.empty()) {
-            // Ghi trực tiếp mảng byte MJPEG nén xuống file
             outfile.write((char*)current_frame.data, current_frame.total() * current_frame.elemSize());
             frames_written++;
         }
@@ -83,19 +75,14 @@ void writer_thread_func(string filename) {
 }
 
 int main(int argc, char** argv) {
-    // Tạo thư mục đích nếu chưa có
     system(("mkdir -p " + SD_DIR).c_str());
-
-    // --- XỬ LÝ TÊN FILE THÔNG MINH ---
     string input_name = getCmdOption(argv, argv + argc, "--name");
     string filename_base = "";
 
     if (!input_name.empty()) {
-        // Lọc bỏ đường dẫn (chỉ lấy tên file)
         size_t last_slash = input_name.find_last_of("/\\");
         string basename = (last_slash != string::npos) ? input_name.substr(last_slash + 1) : input_name;
 
-        // Lọc bỏ đuôi mở rộng (.mp4)
         size_t last_dot = basename.find_last_of(".");
         if (last_dot != string::npos) {
             filename_base = basename.substr(0, last_dot);
@@ -113,10 +100,8 @@ int main(int argc, char** argv) {
     cout << "Final MP4: " << sd_path << endl;
     cout << "Temp RAM : " << ram_path << endl;
 
-    // --- CẤU HÌNH CAMERA ---
-    // QUAN TRỌNG: Sửa lại exposure ngay tại đây để tránh lỗi 6 FPS
     cout << "[Camera] Forcing Exposure Settings..." << endl;
-    system("v4l2-ctl -d /dev/video0 -c exposure_auto=1");     // 1=Manual
+    system("v4l2-ctl -d /dev/video0 -c exposure_auto=1");
     system("v4l2-ctl -d /dev/video0 -c exposure_absolute=50"); // Chỉnh số này nếu ảnh quá tối/sáng
 
     VideoCapture cap(0, CAP_V4L2);
@@ -125,20 +110,16 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // 1. Set MJPG
     cap.set(CAP_PROP_FOURCC, VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    // 2. Set Resolution
+
     cap.set(CAP_PROP_FRAME_WIDTH, 1280);
     cap.set(CAP_PROP_FRAME_HEIGHT, 720);
     cap.set(CAP_PROP_FPS, TARGET_FPS);
-    // 3. TẮT GIẢI MÃ (KEY OPTIMIZATION)
     cap.set(CAP_PROP_CONVERT_RGB, 0); 
 
-    // Kiểm tra thực tế
     double fps_set = cap.get(CAP_PROP_FPS);
     cout << "[Camera] Initialized. Driver reports FPS: " << fps_set << endl;
 
-    // --- KHỞI CHẠY THREAD GHI ---
     thread t_writer(writer_thread_func, ram_path);
 
     cout << "--- START RECORDING (60s) ---" << endl;
@@ -151,13 +132,9 @@ int main(int argc, char** argv) {
     Mat raw_frame;
     
     while (true) {
-        // Đọc Raw Frame (Cực nhanh, < 1ms)
         if (cap.read(raw_frame)) {
             frames_read++;
             frames_in_sec++;
-            
-            // Push vào queue
-            // clone() ở đây chỉ copy khoảng 150KB dữ liệu nén, rất nhẹ
             {
                 lock_guard<mutex> lock(mtx);
                 frame_queue.push(raw_frame.clone()); 
@@ -168,7 +145,6 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // --- LOG REALTIME (Mỗi 1 giây) ---
         auto now = chrono::steady_clock::now();
         double elapsed_sec = chrono::duration_cast<chrono::duration<double>>(now - last_log).count();
         if (elapsed_sec >= 1.0) {
@@ -177,13 +153,9 @@ int main(int argc, char** argv) {
             frames_in_sec = 0;
             last_log = now;
         }
-
-        // Dừng sau 60s
         double total_elapsed = chrono::duration_cast<chrono::duration<double>>(now - start_time).count();
         if (total_elapsed >= RECORD_SECONDS) break;
     }
-
-    // --- KẾT THÚC ---
     {
         lock_guard<mutex> lock(mtx);
         is_capturing = false;
@@ -205,16 +177,12 @@ int main(int argc, char** argv) {
     if (frames_written < 100) {
         cerr << "[Warning] Frame count too low! Check Camera Light/Exposure." << endl;
     } else {
-        // Convert sang MP4 bằng FFmpeg
         cout << "[FFmpeg] Encoding from RAM to SD Card..." << endl;
-        // Lệnh encode tối ưu cho Pi 4
         string cmd = "ffmpeg -y -framerate " + to_string(avg_fps) + " -f mjpeg -i " + ram_path + 
                      " -c:v libx264 -preset fast -pix_fmt yuv420p " + 
-                     sd_path + " > /dev/null 2>&1"; // Ẩn output rác của ffmpeg
+                     sd_path + " > /dev/null 2>&1";
         
         system(cmd.c_str());
-        
-        // Xóa file tạm
         remove(ram_path.c_str());
         cout << "[Success] Video Saved: " << sd_path << endl;
     }
